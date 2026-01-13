@@ -1,0 +1,20 @@
+{
+	"name": "turquoise-avantio",
+	"version": "1.0.0",
+	"description": "Avantio bookings extractor - runs in both Google Apps Script and Node.js",
+	"main": "code.js",
+	"scripts": {
+		"start": "node code.js",
+		"dev": "node --watch code.js"
+	},
+	"keywords": [
+		"avantio",
+		"bookings"
+	],
+	"author": "",
+	"license": "ISC",
+	"dependencies": {
+		"axios": "^1.6.5",
+		"dotenv": "^16.3.1"
+	}
+}
