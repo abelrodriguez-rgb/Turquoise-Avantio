@@ -8,6 +8,8 @@
  * The same code works in both environments without modification.
  */
 
+const from = '2026-01-01';
+
 // ==================== ENVIRONMENT DETECTION ====================
 // Detect if we're running in Google Apps Script or Node.js
 const IS_GAS = typeof UrlFetchApp !== 'undefined';
@@ -27,17 +29,16 @@ if (IS_NODE) {
  * - Node.js: Reads from .env file
  */
 function getConfig() {
+	// Start date
 	if (IS_GAS) {
 		return {
 			AVANTIO_API_TOKEN: AVANTIO_API_TOKEN, // From secrets.gs
-			DEPARTURE_START_DATE: '2026-01-01',
-			CURRENT_YEAR: 2026
+			DEPARTURE_START_DATE: from,
 		};
 	} else {
 		return {
 			AVANTIO_API_TOKEN: process.env.AVANTIO_API_TOKEN,
-			DEPARTURE_START_DATE: process.env.DEPARTURE_START_DATE || '2026-01-01',
-			CURRENT_YEAR: parseInt(process.env.CURRENT_YEAR || '2026')
+			DEPARTURE_START_DATE: process.env.DEPARTURE_START_DATE || from,
 		};
 	}
 }
@@ -68,11 +69,11 @@ async function httpGet(url, headers) {
 		const response = UrlFetchApp.fetch(url, options);
 		const statusCode = response.getResponseCode();
 		const text = response.getContentText();
-		
+
 		if (statusCode >= 400) {
 			throw new Error(`HTTP ${statusCode}: ${text}`);
 		}
-		
+
 		return JSON.parse(text);
 	} else {
 		// Node.js: Use axios
@@ -122,7 +123,7 @@ async function callAvantioAPI(endpoint, errorContext) {
  */
 async function getBookingDetails(id) {
 	if (!id) return null;
-	
+
 	const data = await callAvantioAPI(`/bookings/${id}`, `fetching booking ${id}`);
 	if (data && !IS_GAS) log.info(`✓ Fetched booking details for ${id}`);
 	return data;
@@ -139,13 +140,13 @@ async function getAccommodationName(id) {
 	if (ACCOMMODATION_CACHE[id]) return ACCOMMODATION_CACHE[id];
 
 	const acc = await callAvantioAPI(`/accommodations/${id}`, `fetching accommodation ${id}`);
-	
+
 	if (acc) {
 		const name = acc.name || acc.internalName || String(id);
 		ACCOMMODATION_CACHE[id] = name;
 		return name;
 	}
-	
+
 	// Cache failed lookups too to avoid retrying
 	ACCOMMODATION_CACHE[id] = String(id);
 	return ACCOMMODATION_CACHE[id];
@@ -163,7 +164,7 @@ async function getCustomerData(id) {
 	if (CUSTOMER_CACHE[id]) return CUSTOMER_CACHE[id];
 
 	const cust = await callAvantioAPI(`/customers/${id}`, `fetching customer ${id}`);
-	
+
 	if (!cust) {
 		CUSTOMER_CACHE[id] = {};
 		return {};
@@ -221,6 +222,25 @@ function calcularNoches(checkIn, checkOut) {
 	}
 }
 
+/**
+ * Formats a date string (ISO/UTC) to simple yyyy-mm-dd format
+ * @param {string} dateString - Date string in any format
+ * @returns {string} Date in yyyy-mm-dd format or empty string
+ */
+function formatDateSimple(dateString) {
+	if (!dateString) return '';
+	try {
+		// If it already looks like yyyy-mm-dd (10 chars), return as is
+		if (dateString.length === 10 && dateString.match(/^\d{4}-\d{2}-\d{2}$/)) {
+			return dateString;
+		}
+		// Otherwise split by 'T' to extract date portion from ISO format
+		return dateString.split('T')[0];
+	} catch (e) {
+		return '';
+	}
+}
+
 // ==================== PROCESS BOOKING ====================
 
 /**
@@ -246,15 +266,35 @@ async function processBooking(booking) {
 	const accommodationId = booking.accommodation?.id || null;
 	const propertyName = accommodationId ? await getAccommodationName(accommodationId) : '';
 
-	// Extract customer data (try API first, then use embedded data)
-	const customerId = booking.customer?.id || null;
-	let customerData = {};
-	
-	if (customerId) {
+	// Extract occupant data (guest staying at the property, NOT the customer who made the booking)
+	// Try occupant first (the actual guest), fallback to customer if no occupant
+	const occupantId = booking.occupant?.id || null;
+	let guestData = {};
+
+	if (occupantId) {
 		// Fetch from API endpoint
-		customerData = await getCustomerData(customerId);
+		guestData = await getCustomerData(occupantId);
+	} else if (booking.occupant) {
+		// Extract from embedded occupant object
+		const occObj = booking.occupant;
+		let name = occObj.name || '';
+		if (occObj.surnames && Array.isArray(occObj.surnames)) {
+			name += ' ' + occObj.surnames.join(' ');
+		}
+
+		let phone = '';
+		if (occObj.contact?.phones?.[0]?.number) {
+			phone = occObj.contact.phones[0].number.trim();
+		}
+
+		let email = '';
+		if (occObj.contact?.emails?.[0]) {
+			email = occObj.contact.emails[0].trim();
+		}
+
+		guestData = { name, phone, email };
 	} else if (booking.customer) {
-		// Extract from embedded customer object
+		// Fallback to customer if no occupant data
 		const custObj = booking.customer;
 		let name = custObj.name || '';
 		if (custObj.surnames && Array.isArray(custObj.surnames)) {
@@ -271,14 +311,14 @@ async function processBooking(booking) {
 			email = custObj.contact.emails[0].trim();
 		}
 
-		customerData = { name, phone, email };
+		guestData = { name, phone, email };
 	}
 
 	// Extract prices (API stores amounts as integers with separate decimal places)
 	// Example: 123456 with decimalPlaces=3 means 123.456
 	const decimalPlaces = booking.decimalPlaces || 0;
 	const divisor = decimalPlaces > 0 ? Math.pow(10, decimalPlaces) : 1;
-	
+
 	let totalPrice = '';
 	if (booking.amounts?.total) {
 		const net = booking.amounts.total.net || 0;
@@ -294,8 +334,9 @@ async function processBooking(booking) {
 	// Extract dates from booking
 	const arrivalDate = booking.stayDates?.arrival || '';
 	const departureDate = booking.stayDates?.departure || '';
-	const reservationDate = booking.creationDate || '';
-	const cancellationDate = booking.cancellationDate || booking.cancelledAt || '';
+	const reservationDate = formatDateSimple(booking.creationDate || '');
+	// Cancellation date can be in multiple formats
+	const cancellationDate = formatDateSimple(booking.cancellationDate || booking.cancelledAt || booking.canceledDate || '');
 
 	// Extract other booking fields
 	const nights = booking.nights || calcularNoches(arrivalDate, departureDate);
@@ -307,7 +348,7 @@ async function processBooking(booking) {
 	return {
 		id: bookingId,
 		propiedad: propertyName,
-		huesped: customerData.name || '',
+		huesped: guestData.name || '',
 		canal: channel,
 		precio: totalPrice,
 		comision: commission,
@@ -317,8 +358,8 @@ async function processBooking(booking) {
 		fCancelado: cancellationDate,
 		noches: nights,
 		estado: status,
-		telefono: customerData.phone || '',
-		email: customerData.email || '',
+		telefono: guestData.phone || '',
+		email: guestData.email || '',
 		adultos: adults
 	};
 }
@@ -326,14 +367,13 @@ async function processBooking(booking) {
 // ==================== OUTPUT HANDLERS ====================
 
 /**
- * Outputs bookings to Google Sheets
- * Creates "Reservas" sheet if it doesn't exist
- * @param {Array<Object>} bookings - Array of processed bookings
+ * Gets or creates the Reservas sheet with headers
+ * @returns {GoogleAppsScript.Spreadsheet.Sheet} The Reservas sheet
  */
-function outputToSheets(bookings) {
+function getOrCreateSheet() {
 	const ss = SpreadsheetApp.getActiveSpreadsheet();
 	let sheet = ss.getSheetByName('Reservas');
-	
+
 	// Create sheet with headers if it doesn't exist
 	if (!sheet) {
 		sheet = ss.insertSheet('Reservas');
@@ -344,6 +384,36 @@ function outputToSheets(bookings) {
 		]];
 		sheet.getRange(1, 1, 1, header[0].length).setValues(header);
 	}
+
+	return sheet;
+}
+
+/**
+ * Loads existing booking IDs from sheet into a Set for duplicate checking
+ * @param {GoogleAppsScript.Spreadsheet.Sheet} sheet - The Reservas sheet
+ * @returns {Set<string>} Set of existing booking IDs
+ */
+function loadExistingBookingIds(sheet) {
+	if (sheet.getLastRow() <= 1) {
+		// Only header row or empty sheet
+		return new Set();
+	}
+	
+	// Get all IDs from column A (starting from row 2, skipping header)
+	const idRange = sheet.getRange(2, 1, sheet.getLastRow() - 1, 1);
+	const ids = idRange.getValues();
+	
+	// Convert to Set for fast lookup
+	return new Set(ids.map(row => String(row[0])));
+}
+
+/**
+ * Outputs bookings to Google Sheets
+ * Creates "Reservas" sheet if it doesn't exist
+ * @param {Array<Object>} bookings - Array of processed bookings
+ */
+function outputToSheets(bookings) {
+	const sheet = getOrCreateSheet();
 
 	// Convert bookings to rows
 	const rows = bookings.map(b => [
@@ -361,13 +431,42 @@ function outputToSheets(bookings) {
 }
 
 /**
- * Outputs bookings to console as a formatted table
- * @param {Array<Object>} bookings - Array of processed bookings
+ * Outputs a single booking to Google Sheets immediately if not a duplicate
+ * @param {Object} booking - Processed booking to add
+ * @param {Set<string>} existingIds - Set of existing booking IDs
+ * @returns {boolean} True if added, false if skipped (duplicate)
  */
-function outputToConsole(bookings) {
-	console.log('='.repeat(150));
-	console.log(`📊 TOTAL BOOKINGS FOUND: ${bookings.length}`);
-	console.log('='.repeat(150));
+function outputBookingToSheet(booking, existingIds) {
+	// Check for duplicate
+	const bookingIdStr = String(booking.id);
+	if (existingIds.has(bookingIdStr)) {
+		return false; // Skip duplicate
+	}
+	
+	const sheet = getOrCreateSheet();
+	
+	const row = [
+		booking.id, booking.propiedad, booking.huesped, booking.canal, 
+		booking.precio, booking.comision, booking.checkIn, booking.checkOut, 
+		booking.fReserva, booking.fCancelado, booking.noches, booking.estado, 
+		booking.telefono, booking.email, booking.adultos
+	];
+
+	sheet.getRange(sheet.getLastRow() + 1, 1, 1, row.length).setValues([row]);
+	
+	// Add to Set so we don't re-add in same execution
+	existingIds.add(bookingIdStr);
+	
+	return true; // Successfully added
+}
+
+/**
+ * Prints console table header
+ */
+function printConsoleHeader() {
+	console.log('='.repeat(200));
+	console.log('📊 RESERVATIONS');
+	console.log('='.repeat(200));
 	console.log('');
 
 	// Print table header
@@ -377,38 +476,83 @@ function outputToConsole(bookings) {
 		'Huesped'.padEnd(18) +
 		'Canal'.padEnd(22) +
 		'Precio'.padEnd(10) +
+		'Comision'.padEnd(10) +
 		'Check-In'.padEnd(12) +
 		'Check-Out'.padEnd(12) +
+		'FReserva'.padEnd(12) +
+		'FCancelado'.padEnd(12) +
 		'Noches'.padEnd(8) +
 		'Estado'.padEnd(12) +
 		'Teléfono'.padEnd(15) +
 		'Email'.padEnd(25) +
 		'Adultos'
 	);
-	console.log('-'.repeat(150));
+	console.log('-'.repeat(200));
+}
+
+/**
+ * Prints a single booking to console
+ * @param {Object} booking - Processed booking to print
+ */
+function printBookingToConsole(booking) {
+	console.log(
+		String(booking.id).padEnd(12) +
+		String(booking.propiedad).substring(0, 17).padEnd(18) +
+		String(booking.huesped).substring(0, 17).padEnd(18) +
+		String(booking.canal).substring(0, 21).padEnd(22) +
+		String(booking.precio).padEnd(10) +
+		String(booking.comision).padEnd(10) +
+		String(booking.checkIn).padEnd(12) +
+		String(booking.checkOut).padEnd(12) +
+		String(booking.fReserva).padEnd(12) +
+		String(booking.fCancelado).padEnd(12) +
+		String(booking.noches).padEnd(8) +
+		String(booking.estado).substring(0, 11).padEnd(12) +
+		String(booking.telefono).substring(0, 14).padEnd(15) +
+		String(booking.email).substring(0, 24).padEnd(25) +
+		String(booking.adultos)
+	);
+}
+
+/**
+ * Outputs bookings to console as a formatted table
+ * @param {Array<Object>} bookings - Array of processed bookings
+ */
+function outputToConsole(bookings) {
+	console.log('='.repeat(200));
+	console.log(`📊 TOTAL BOOKINGS FOUND: ${bookings.length}`);
+	console.log('='.repeat(200));
+	console.log('');
+
+	// Print table header
+	console.log(
+		'ID'.padEnd(12) +
+		'Propiedad'.padEnd(18) +
+		'Huesped'.padEnd(18) +
+		'Canal'.padEnd(22) +
+		'Precio'.padEnd(10) +
+		'Comision'.padEnd(10) +
+		'Check-In'.padEnd(12) +
+		'Check-Out'.padEnd(12) +
+		'FReserva'.padEnd(12) +
+		'FCancelado'.padEnd(12) +
+		'Noches'.padEnd(8) +
+		'Estado'.padEnd(12) +
+		'Teléfono'.padEnd(15) +
+		'Email'.padEnd(25) +
+		'Adultos'
+	);
+	console.log('-'.repeat(200));
 
 	// Print each booking row
 	for (const booking of bookings) {
-		console.log(
-			String(booking.id).padEnd(12) +
-			String(booking.propiedad).substring(0, 17).padEnd(18) +
-			String(booking.huesped).substring(0, 17).padEnd(18) +
-			String(booking.canal).substring(0, 21).padEnd(22) +
-			String(booking.precio).padEnd(10) +
-			String(booking.checkIn).padEnd(12) +
-			String(booking.checkOut).padEnd(12) +
-			String(booking.noches).padEnd(8) +
-			String(booking.estado).substring(0, 11).padEnd(12) +
-			String(booking.telefono).substring(0, 14).padEnd(15) +
-			String(booking.email).substring(0, 24).padEnd(25) +
-			String(booking.adultos)
-		);
+		printBookingToConsole(booking);
 	}
 
 	console.log('');
-	console.log('='.repeat(150));
+	console.log('='.repeat(200));
 	console.log('✅ Extraction completed successfully!');
-	console.log('='.repeat(150));
+	console.log('='.repeat(200));
 }
 
 // ==================== MAIN FUNCTION ====================
@@ -420,13 +564,14 @@ function outputToConsole(bookings) {
  * 1. Validates configuration
  * 2. Fetches bookings from API (with pagination)
  * 3. Processes each booking (enriches with full data)
- * 4. Outputs results to appropriate destination
+ * 4. Outputs results to appropriate destination IMMEDIATELY as they are fetched
  */
 async function obtenerReservasAvantio() {
 	// Show startup message in Node.js
+	const currentYear = new Date().getFullYear();
 	if (!IS_GAS) {
 		console.log('🚀 Starting Avantio Bookings Extraction\n');
-		console.log(`📅 Fetching bookings from ${CONFIG.DEPARTURE_START_DATE} to ${CONFIG.CURRENT_YEAR}-12-31\n`);
+		console.log(`📅 Fetching bookings from ${CONFIG.DEPARTURE_START_DATE} to ${currentYear}-12-31\n`);
 	}
 
 	// Validate configuration
@@ -436,32 +581,55 @@ async function obtenerReservasAvantio() {
 		return;
 	}
 
-	const departureEndDate = `${CONFIG.CURRENT_YEAR}-12-31`;
+	const departureEndDate = `${currentYear}-12-31`;
 	let paginationCursor = null;
-	const allBookings = [];
+	let totalBookingsCount = 0;
+	let skippedDuplicatesCount = 0;
+	let existingIds = null;
+	
+	// Print console header once in Node.js before processing bookings
+	if (!IS_GAS) {
+		printConsoleHeader();
+	}
+	
+	// Load existing booking IDs for duplicate checking in GAS
+	if (IS_GAS) {
+		const sheet = getOrCreateSheet();
+		existingIds = loadExistingBookingIds(sheet);
+		log.info(`Loaded ${existingIds.size} existing booking IDs`);
+	}
 
 	try {
 		// Pagination loop: Keep fetching until no more results
 		while (true) {
-			// Build query parameters
-			const params = {
-				limit: '50',
-				departureDate_from: `${CONFIG.DEPARTURE_START_DATE}T00:00:00.000Z`,
-				departureDate_to: `${departureEndDate}T23:59:59.999Z`
-			};
+			let url;
 
-			// First request: sort by date. Subsequent: use cursor
-			if (!paginationCursor) params.sort = 'departureDate';
-			if (paginationCursor) params.pagination_cursor = paginationCursor;
+			if (paginationCursor) {
+				// Use cursor only (cursor already contains all filter parameters)
+				url = `${API_BASE_URL}/bookings?pagination_cursor=${encodeURIComponent(paginationCursor)}`;
+			} else {
+				// First request: build query parameters
+				const params = {
+					limit: '50', // API maximum is 50
+					departureDate_from: `${CONFIG.DEPARTURE_START_DATE}T00:00:00.000Z`,
+					departureDate_to: `${departureEndDate}T23:59:59.999Z`,
+					sort: 'departureDate'
+				};
 
-			// Build query string
-			const queryString = Object.keys(params)
-				.map(key => `${key}=${encodeURIComponent(params[key])}`)
-				.join('&');
+				const queryString = Object.keys(params)
+					.map(key => `${key}=${encodeURIComponent(params[key])}`)
+					.join('&');
 
-			const url = `${API_BASE_URL}/bookings?${queryString}`;
-			
-			if (!IS_GAS) log.info('📡 Fetching page...');
+				url = `${API_BASE_URL}/bookings?${queryString}`;
+			}
+
+			if (!IS_GAS) {
+				log.info('📡 Fetching page...');
+				if (!paginationCursor) {
+					// Log search parameters on first request
+					log.info(`   Searching: ${CONFIG.DEPARTURE_START_DATE} to ${departureEndDate}`);
+				}
+			}
 
 			// Fetch bookings page
 			const data = await httpGet(url, {
@@ -473,7 +641,12 @@ async function obtenerReservasAvantio() {
 			let resultados = data.data || data.bookings || [];
 			if (!Array.isArray(resultados)) resultados = [];
 
-			log.info(`✓ Received ${resultados.length} bookings`);
+			// Log pagination info for debugging
+			if (!IS_GAS && data.pagination) {
+				log.info(`   Pagination: total=${data.pagination.total_items || '?'}, cursor=${data.pagination.next_cursor ? 'yes' : 'no'}`);
+			}
+
+			log.info(`✓ Received ${resultados.length} bookings in this page`);
 
 			// No more results, exit loop
 			if (resultados.length === 0) {
@@ -481,14 +654,39 @@ async function obtenerReservasAvantio() {
 				break;
 			}
 
-			// Process each booking (fetch full details, accommodation, customer)
-			for (const booking of resultados) {
-				const processedBooking = await processBooking(booking);
-				allBookings.push(processedBooking);
+		// Process each booking and OUTPUT IMMEDIATELY
+		for (const booking of resultados) {
+			const processedBooking = await processBooking(booking);
+			
+			// Output immediately after processing
+			if (IS_GAS) {
+				const added = outputBookingToSheet(processedBooking, existingIds);
+				if (added) {
+					totalBookingsCount++;
+				} else {
+					skippedDuplicatesCount++;
+				}
+			} else {
+				printBookingToConsole(processedBooking);
+				totalBookingsCount++;
 			}
+		}
 
 			// Check if there are more pages
-			if (data.pagination?.next_cursor) {
+			// API returns next link in _links.next, extract cursor from it
+			if (data._links && data._links.next) {
+				// Extract pagination_cursor from the next URL
+				const nextUrl = data._links.next;
+				const match = nextUrl.match(/pagination_cursor=([^&]+)/);
+				if (match && match[1]) {
+					paginationCursor = decodeURIComponent(match[1]);
+					if (!IS_GAS) log.info('→ Next page available\n');
+				} else {
+					log.info('✓ No more pages (no cursor in next link)');
+					break;
+				}
+			} else if (data.pagination?.next_cursor) {
+				// Fallback: Try old pagination format
 				paginationCursor = data.pagination.next_cursor;
 				if (!IS_GAS) log.info('→ Next page available\n');
 			} else {
@@ -497,12 +695,18 @@ async function obtenerReservasAvantio() {
 			}
 		}
 
-		// Output results based on environment
-		if (IS_GAS) {
-			outputToSheets(allBookings);
-		} else {
-			outputToConsole(allBookings);
+	// Print final summary
+	if (IS_GAS) {
+		log.info(`✓ ${totalBookingsCount} new reservas agregadas a Google Sheets`);
+		if (skippedDuplicatesCount > 0) {
+			log.info(`⊘ ${skippedDuplicatesCount} duplicates skipped`);
 		}
+	} else {
+		console.log('');
+		console.log('='.repeat(200));
+		console.log(`✅ Extraction completed successfully! Total bookings: ${totalBookingsCount}`);
+		console.log('='.repeat(200));
+	}
 
 	} catch (error) {
 		log.error(`Error during extraction: ${error.message}`);
